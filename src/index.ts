@@ -2,26 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as path from 'path';
-import {
-  CustomResource, Duration, RemovalPolicy,
-  Stack,
-} from 'aws-cdk-lib';
+import { CustomResource, Duration, RemovalPolicy, Stack } from 'aws-cdk-lib';
 import {
   GatewayVpcEndpoint,
   GatewayVpcEndpointAwsService,
   Port,
-  SecurityGroup, SubnetType, Vpc,
+  SecurityGroup,
+  SubnetType,
+  Vpc,
 } from 'aws-cdk-lib/aws-ec2';
-import { FileSystem, LifecyclePolicy, PerformanceMode } from 'aws-cdk-lib/aws-efs';
+import {
+  FileSystem,
+  LifecyclePolicy,
+  PerformanceMode,
+} from 'aws-cdk-lib/aws-efs';
 import { EventBus, Rule, Schedule } from 'aws-cdk-lib/aws-events';
 import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
 import {
   AccountRootPrincipal,
-  AddToResourcePolicyResult, AnyPrincipal, ArnPrincipal, Effect,
+  AddToResourcePolicyResult,
+  AnyPrincipal,
+  ArnPrincipal,
+  Effect,
   PolicyStatement,
 } from 'aws-cdk-lib/aws-iam';
 import {
-  Code, DockerImageCode,
+  Code,
+  DockerImageCode,
   DockerImageFunction,
   Function,
   IDestination,
@@ -32,9 +39,19 @@ import {
   EventBridgeDestination,
   SqsDestination,
 } from 'aws-cdk-lib/aws-lambda-destinations';
-import { Bucket, BucketEncryption, EventType, IBucket, ObjectOwnership } from 'aws-cdk-lib/aws-s3';
+import {
+  Bucket,
+  BucketEncryption,
+  EventType,
+  IBucket,
+  ObjectOwnership,
+} from 'aws-cdk-lib/aws-s3';
 import { LambdaDestination } from 'aws-cdk-lib/aws-s3-notifications';
+import * as sns_notifications from 'aws-cdk-lib/aws-s3-notifications';
+import { Topic } from 'aws-cdk-lib/aws-sns';
+import { LambdaSubscription } from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Queue, QueueEncryption } from 'aws-cdk-lib/aws-sqs';
+
 import { Construct } from 'constructs';
 
 /**
@@ -93,6 +110,8 @@ export interface ServerlessClamscanProps {
    * Allows the use of imported buckets. When using imported buckets the user is responsible for adding the required policy statement to the bucket policy: `getPolicyStatementForBucket()` can be used to retrieve the policy statement required by the solution.
    */
   readonly acceptResponsibilityForUsingImportedBucket?: boolean;
+
+  readonly acceptSNSTopic?: boolean;
 }
 
 /**
@@ -180,6 +199,7 @@ export class ServerlessClamscan extends Construct {
   private _efsRootPath = '/lambda';
   private _efsMountPath = `/mnt${this._efsRootPath}`;
   private _efsDefsPath = 'virus_database/';
+  private s3EventTopic: Topic = new Topic(this, 'S3EventTopic');
 
   /**
    * Creates a ServerlessClamscan construct.
@@ -227,13 +247,15 @@ export class ServerlessClamscan extends Construct {
       this.errorDeadLetterQueue = new Queue(this, 'ScanErrorDeadLetterQueue', {
         encryption: QueueEncryption.KMS_MANAGED,
       });
-      this.errorDeadLetterQueue.addToResourcePolicy(new PolicyStatement({
-        actions: ['sqs:*'],
-        effect: Effect.DENY,
-        principals: [new AnyPrincipal()],
-        conditions: { Bool: { 'aws:SecureTransport': false } },
-        resources: [this.errorDeadLetterQueue.queueArn],
-      }));
+      this.errorDeadLetterQueue.addToResourcePolicy(
+        new PolicyStatement({
+          actions: ['sqs:*'],
+          effect: Effect.DENY,
+          principals: [new AnyPrincipal()],
+          conditions: { Bool: { 'aws:SecureTransport': false } },
+          resources: [this.errorDeadLetterQueue.queueArn],
+        }),
+      );
       this.errorQueue = new Queue(this, 'ScanErrorQueue', {
         encryption: QueueEncryption.KMS_MANAGED,
         deadLetterQueue: {
@@ -241,13 +263,15 @@ export class ServerlessClamscan extends Construct {
           queue: this.errorDeadLetterQueue,
         },
       });
-      this.errorQueue.addToResourcePolicy(new PolicyStatement({
-        actions: ['sqs:*'],
-        effect: Effect.DENY,
-        principals: [new AnyPrincipal()],
-        conditions: { Bool: { 'aws:SecureTransport': false } },
-        resources: [this.errorQueue.queueArn],
-      }));
+      this.errorQueue.addToResourcePolicy(
+        new PolicyStatement({
+          actions: ['sqs:*'],
+          effect: Effect.DENY,
+          principals: [new AnyPrincipal()],
+          conditions: { Bool: { 'aws:SecureTransport': false } },
+          resources: [this.errorQueue.queueArn],
+        }),
+      );
       this.errorDest = new SqsDestination(this.errorQueue);
     } else {
       this.errorDest = props.onError;
@@ -272,7 +296,8 @@ export class ServerlessClamscan extends Construct {
       vpc: vpc,
       encrypted: props.efsEncryption === false ? false : true,
       lifecyclePolicy: LifecyclePolicy.AFTER_7_DAYS,
-      performanceMode: props.efsPerformanceMode ?? PerformanceMode.GENERAL_PURPOSE,
+      performanceMode:
+        props.efsPerformanceMode ?? PerformanceMode.GENERAL_PURPOSE,
       removalPolicy: RemovalPolicy.DESTROY,
       securityGroup: new SecurityGroup(this, 'ScanFileSystemSecurityGroup', {
         vpc: vpc,
@@ -485,8 +510,14 @@ export class ServerlessClamscan extends Construct {
 
     if (props.buckets) {
       props.buckets.forEach((bucket) => {
-        this.addSourceBucket(bucket);
+        this.addSourceBucket(bucket, props.acceptSNSTopic);
       });
+    }
+
+    if (props.acceptSNSTopic) {
+      this.s3EventTopic.addSubscription(
+        new LambdaSubscription(this._scanFunction),
+      );
     }
   }
 
@@ -502,7 +533,6 @@ export class ServerlessClamscan extends Construct {
       throw new Error('The scan function role is undefined');
     }
   }
-
 
   /**
    * Returns the statement that should be added to the bucket policy
@@ -529,12 +559,17 @@ export class ServerlessClamscan extends Construct {
             ],
           },
           ArnNotEquals: {
-            'aws:PrincipalArn': [this._scanFunction.role.roleArn, scan_assumed_principal.arn],
+            'aws:PrincipalArn': [
+              this._scanFunction.role.roleArn,
+              scan_assumed_principal.arn,
+            ],
           },
         },
       });
     } else {
-      throw new Error("Can't generate a valid S3 bucket policy, the scan function role is undefined");
+      throw new Error(
+        "Can't generate a valid S3 bucket policy, the scan function role is undefined",
+      );
     }
   }
 
@@ -544,11 +579,18 @@ export class ServerlessClamscan extends Construct {
      Adds a bucket policy to disallow GetObject operations on files that are tagged 'IN PROGRESS', 'INFECTED', or 'ERROR'.
    * @param bucket The bucket to add the scanning bucket policy and s3:ObjectCreate* trigger to.
    */
-  addSourceBucket(bucket: IBucket) {
-    bucket.addEventNotification(
-      EventType.OBJECT_CREATED,
-      new LambdaDestination(this._scanFunction),
-    );
+  addSourceBucket(bucket: IBucket, acceptSNSTopic?: boolean) {
+    if (acceptSNSTopic) {
+      bucket.addEventNotification(
+        EventType.OBJECT_CREATED,
+        new sns_notifications.SnsDestination(this.s3EventTopic),
+      );
+    } else {
+      bucket.addEventNotification(
+        EventType.OBJECT_CREATED,
+        new LambdaDestination(this._scanFunction),
+      );
+    }
 
     bucket.grantRead(this._scanFunction);
     this._scanFunction.addToRolePolicy(
@@ -583,7 +625,9 @@ export class ServerlessClamscan extends Construct {
       );
 
       if (!result.statementAdded && !this.useImportedBuckets) {
-        throw new Error('acceptResponsibilityForUsingImportedBucket must be set when adding an imported bucket. When using imported buckets the user is responsible for adding the required policy statement to the bucket policy: `getPolicyStatementForBucket()` can be used to retrieve the policy statement required by the solution');
+        throw new Error(
+          'acceptResponsibilityForUsingImportedBucket must be set when adding an imported bucket. When using imported buckets the user is responsible for adding the required policy statement to the bucket policy: `getPolicyStatementForBucket()` can be used to retrieve the policy statement required by the solution',
+        );
       }
     }
   }
